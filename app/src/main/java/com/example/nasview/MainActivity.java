@@ -56,6 +56,8 @@ import java.net.ServerSocket;
 import java.net.Socket;
 import java.net.InetSocketAddress;
 import java.net.SocketTimeoutException;
+import java.net.HttpURLConnection;
+import java.net.URL;
 import java.nio.charset.StandardCharsets;
 import java.security.KeyStore;
 import java.util.ArrayList;
@@ -78,6 +80,8 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipInputStream;
 
@@ -85,6 +89,8 @@ import javax.crypto.Cipher;
 import javax.crypto.KeyGenerator;
 import javax.crypto.SecretKey;
 import javax.crypto.spec.GCMParameterSpec;
+
+import org.json.JSONObject;
 
 import jcifs.CIFSContext;
 import jcifs.config.PropertyConfiguration;
@@ -118,12 +124,18 @@ public class MainActivity extends Activity {
     private static final int MEDIA_AUDIO = 3;
     private static final int VIDEO_CONTROLS_AUTO_HIDE_MS = 3200;
     private static final int STREAM_BUFFER_SIZE = 256 * 1024;
-    private static final int HISTORY_MAX_ENTRIES = 20;
+    private static final Pattern RJ_CODE_PATTERN = Pattern.compile("(?i)(RJ\\d{6,10})");
+    private static final String RJ_INFO_ENDPOINT =
+            "https://www.dlsite.com/maniax/product/info/ajax?product_id=";
+    private static final long RJ_CACHE_TTL_MS = 30L * 24L * 60L * 60L * 1000L;
+    private static final long RJ_MISSING_CACHE_TTL_MS = 24L * 60L * 60L * 1000L;
 
     private final ExecutorService executor = Executors.newSingleThreadExecutor();
     private final ExecutorService thumbnailExecutor = Executors.newFixedThreadPool(2);
     private final ExecutorService discoveryExecutor = Executors.newSingleThreadExecutor();
     private final ExecutorService directoryExecutor = Executors.newFixedThreadPool(2);
+    private final ExecutorService connectionCleanupExecutor = Executors.newFixedThreadPool(4);
+    private final ExecutorService rjMetadataExecutor = Executors.newFixedThreadPool(2);
     private LinearLayout root;
     private ProgressBar progress;
     private ScrollView contentScroll;
@@ -170,6 +182,9 @@ public class MainActivity extends Activity {
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
+        getSharedPreferences(PREFS_NAME, MODE_PRIVATE).edit()
+                .remove("history")
+                .apply();
         if (!tryAutoConnect()) {
             showConnection(null);
         }
@@ -185,6 +200,8 @@ public class MainActivity extends Activity {
         thumbnailExecutor.shutdownNow();
         discoveryExecutor.shutdownNow();
         directoryExecutor.shutdownNow();
+        connectionCleanupExecutor.shutdown();
+        rjMetadataExecutor.shutdownNow();
         super.onDestroy();
     }
 
@@ -673,12 +690,6 @@ public class MainActivity extends Activity {
         if (!sameFolder) {
             currentSearchQuery = "";
         }
-        addHistory(new RemoteItem(
-                shareName,
-                path.isEmpty() ? shareName : lastPathSegment(path),
-                path,
-                true
-        ));
         getSharedPreferences(PREFS_NAME, MODE_PRIVATE).edit()
                 .putString("last_share", shareName)
                 .putString("last_path", path)
@@ -796,7 +807,8 @@ public class MainActivity extends Activity {
         DirectoryLoad load = currentDirectoryLoad;
         currentDirectoryLoad = null;
         if (load != null) {
-            load.cancel();
+            load.markCancelled();
+            connectionCleanupExecutor.execute(load::closeConnection);
         }
     }
 
@@ -971,14 +983,9 @@ public class MainActivity extends Activity {
 
     private void renderSavedShortcuts() {
         List<RemoteItem> favorites = favoriteItems();
-        List<RemoteItem> history = historyItems();
         if (!favorites.isEmpty()) {
             root.addView(label("\u304a\u6c17\u306b\u5165\u308a"));
             renderShortcutButtons(favorites, 8);
-        }
-        if (!history.isEmpty()) {
-            root.addView(label("\u6700\u8fd1\u958b\u3044\u305f\u9805\u76ee"));
-            renderShortcutButtons(history, 6);
         }
     }
 
@@ -1037,37 +1044,6 @@ public class MainActivity extends Activity {
             if (item != null) items.add(item);
         }
         Collections.sort(items, Comparator.comparing(item -> item.name.toLowerCase(Locale.ROOT)));
-        return items;
-    }
-
-    private void addHistory(RemoteItem item) {
-        String encoded = encodeShortcut(item);
-        ArrayList<String> records = historyRecords();
-        records.removeIf(record -> record.startsWith(shortcutIdentity(item.share, item.path)));
-        records.add(0, encoded);
-        if (records.size() > HISTORY_MAX_ENTRIES) {
-            records.subList(HISTORY_MAX_ENTRIES, records.size()).clear();
-        }
-        getSharedPreferences(PREFS_NAME, MODE_PRIVATE).edit()
-                .putString("history", String.join(",", records))
-                .apply();
-    }
-
-    private ArrayList<String> historyRecords() {
-        String stored = getSharedPreferences(PREFS_NAME, MODE_PRIVATE).getString("history", "");
-        ArrayList<String> records = new ArrayList<>();
-        if (stored != null && !stored.isEmpty()) {
-            Collections.addAll(records, stored.split(","));
-        }
-        return records;
-    }
-
-    private List<RemoteItem> historyItems() {
-        ArrayList<RemoteItem> items = new ArrayList<>();
-        for (String record : historyRecords()) {
-            RemoteItem item = decodeShortcut(record);
-            if (item != null) items.add(item);
-        }
         return items;
     }
 
@@ -1157,7 +1133,6 @@ public class MainActivity extends Activity {
     }
 
     private void openItem(RemoteItem item) {
-        addHistory(item);
         if (item.directory) {
             if (item.audioGroup) {
                 renderAudioFolder(item);
@@ -1842,6 +1817,16 @@ public class MainActivity extends Activity {
         path.setMaxLines(1);
         tile.addView(path);
 
+        String rjCode = item.directory ? null : detectRjCode(item.name);
+        if (rjCode != null) {
+            TextView rjInfo = label(rjCode + " \u4f5c\u54c1\u60c5\u5831\u3092\u53d6\u5f97\u4e2d\u2026");
+            rjInfo.setTextSize(12);
+            rjInfo.setTextColor(0xff1d6f5f);
+            rjInfo.setMaxLines(3);
+            tile.addView(rjInfo);
+            loadRjMetadataForVisibleTile(rjCode, rjInfo, thumbnailGeneration);
+        }
+
         if (item.audioGroup) {
             badge.setText("\u97f3\u58f0\u30d5\u30a9\u30eb\u30c0");
         } else if (isImage(item.name) || isZip(item.name)) {
@@ -1871,6 +1856,141 @@ public class MainActivity extends Activity {
         }
 
         return tile;
+    }
+
+    private String detectRjCode(String fileName) {
+        Matcher matcher = RJ_CODE_PATTERN.matcher(fileName);
+        return matcher.find() ? matcher.group(1).toUpperCase(Locale.ROOT) : null;
+    }
+
+    private void loadRjMetadataForVisibleTile(String rjCode, TextView target, int generation) {
+        RjMetadata cached = loadCachedRjMetadata(rjCode);
+        if (cached != null) {
+            if (cached.found) {
+                target.setText(formatRjMetadata(cached));
+            } else {
+                target.setText(rjCode + " \u4f5c\u54c1\u60c5\u5831\u306a\u3057");
+                target.setTextColor(0xff60736d);
+            }
+            return;
+        }
+
+        rjMetadataExecutor.execute(() -> {
+            RjMetadata metadata;
+            try {
+                metadata = fetchRjMetadata(rjCode);
+            } catch (Exception ignored) {
+                metadata = null;
+            }
+            if (metadata == null) {
+                runOnUiThread(() -> {
+                    if (generation == thumbnailGeneration) {
+                        target.setText(rjCode + " \u4f5c\u54c1\u60c5\u5831\u306e\u53d6\u5f97\u306b\u5931\u6557");
+                        target.setTextColor(0xff9b1c1c);
+                    }
+                });
+                return;
+            }
+            final RjMetadata loadedMetadata = metadata;
+            saveRjMetadata(loadedMetadata);
+            runOnUiThread(() -> {
+                if (generation != thumbnailGeneration) {
+                    return;
+                }
+                if (loadedMetadata.found) {
+                    target.setText(formatRjMetadata(loadedMetadata));
+                } else {
+                    target.setText(rjCode + " \u4f5c\u54c1\u60c5\u5831\u306a\u3057");
+                    target.setTextColor(0xff60736d);
+                }
+            });
+        });
+    }
+
+    private RjMetadata fetchRjMetadata(String rjCode) throws Exception {
+        HttpURLConnection connection = (HttpURLConnection) new URL(RJ_INFO_ENDPOINT + rjCode)
+                .openConnection();
+        connection.setConnectTimeout(5000);
+        connection.setReadTimeout(7000);
+        connection.setRequestProperty("Accept", "application/json");
+        connection.setRequestProperty("User-Agent", "NAS-View/1.0");
+        try {
+            if (connection.getResponseCode() != HttpURLConnection.HTTP_OK) {
+                throw new IllegalStateException("DLsite returned " + connection.getResponseCode());
+            }
+            try (InputStream input = connection.getInputStream();
+                 ByteArrayOutputStream output = new ByteArrayOutputStream()) {
+                copyLimited(input, output, 2 * 1024 * 1024);
+                String json = output.toString(StandardCharsets.UTF_8.name());
+                JSONObject rootObject = new JSONObject(json);
+                JSONObject product = rootObject.optJSONObject(rjCode);
+                if (product == null) {
+                    return RjMetadata.missing(rjCode);
+                }
+                return new RjMetadata(
+                        rjCode,
+                        product.optString("work_name", ""),
+                        product.optString("maker_name", ""),
+                        true,
+                        System.currentTimeMillis()
+                );
+            }
+        } finally {
+            connection.disconnect();
+        }
+    }
+
+    private void copyLimited(InputStream input, OutputStream output, int maximumBytes) throws Exception {
+        byte[] buffer = new byte[16 * 1024];
+        int total = 0;
+        int read;
+        while ((read = input.read(buffer)) != -1) {
+            total += read;
+            if (total > maximumBytes) {
+                throw new IllegalStateException("RJ metadata response was too large.");
+            }
+            output.write(buffer, 0, read);
+        }
+    }
+
+    private String formatRjMetadata(RjMetadata metadata) {
+        StringBuilder text = new StringBuilder(metadata.code);
+        if (!metadata.title.isEmpty()) {
+            text.append("\n").append(metadata.title);
+        }
+        if (!metadata.maker.isEmpty()) {
+            text.append("\n").append(metadata.maker);
+        }
+        return text.toString();
+    }
+
+    private RjMetadata loadCachedRjMetadata(String rjCode) {
+        SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
+        long fetchedAt = prefs.getLong("rj_time_" + rjCode, 0);
+        if (fetchedAt == 0) {
+            return null;
+        }
+        boolean found = prefs.getBoolean("rj_found_" + rjCode, false);
+        long ttl = found ? RJ_CACHE_TTL_MS : RJ_MISSING_CACHE_TTL_MS;
+        if (System.currentTimeMillis() - fetchedAt > ttl) {
+            return null;
+        }
+        return new RjMetadata(
+                rjCode,
+                prefs.getString("rj_title_" + rjCode, ""),
+                prefs.getString("rj_maker_" + rjCode, ""),
+                found,
+                fetchedAt
+        );
+    }
+
+    private void saveRjMetadata(RjMetadata metadata) {
+        getSharedPreferences(PREFS_NAME, MODE_PRIVATE).edit()
+                .putLong("rj_time_" + metadata.code, metadata.fetchedAt)
+                .putBoolean("rj_found_" + metadata.code, metadata.found)
+                .putString("rj_title_" + metadata.code, metadata.title)
+                .putString("rj_maker_" + metadata.code, metadata.maker)
+                .apply();
     }
 
     private List<RemoteItem> groupAudioByFolder(List<RemoteItem> items) {
@@ -1960,7 +2080,8 @@ public class MainActivity extends Activity {
         ArrayList<ThumbnailLoad> loads = new ArrayList<>(activeThumbnailLoads);
         activeThumbnailLoads.clear();
         for (ThumbnailLoad load : loads) {
-            load.cancel();
+            load.markCancelled();
+            connectionCleanupExecutor.execute(load::closeConnection);
         }
     }
 
@@ -2744,9 +2865,8 @@ public class MainActivity extends Activity {
             connection.compareAndSet(value, null);
         }
 
-        void cancel() {
+        void markCancelled() {
             cancelled.set(true);
-            closeConnection();
             Future<?> activeFuture = future;
             if (activeFuture != null) {
                 activeFuture.cancel(true);
@@ -2786,9 +2906,8 @@ public class MainActivity extends Activity {
             connection.compareAndSet(value, null);
         }
 
-        void cancel() {
+        void markCancelled() {
             cancelled.set(true);
-            closeConnection();
             Future<?> activeFuture = future;
             if (activeFuture != null) {
                 activeFuture.cancel(true);
@@ -2836,6 +2955,26 @@ public class MainActivity extends Activity {
         Credentials(String user, String password) {
             this.user = user;
             this.password = password;
+        }
+    }
+
+    private static class RjMetadata {
+        final String code;
+        final String title;
+        final String maker;
+        final boolean found;
+        final long fetchedAt;
+
+        RjMetadata(String code, String title, String maker, boolean found, long fetchedAt) {
+            this.code = code;
+            this.title = title;
+            this.maker = maker;
+            this.found = found;
+            this.fetchedAt = fetchedAt;
+        }
+
+        static RjMetadata missing(String code) {
+            return new RjMetadata(code, "", "", false, System.currentTimeMillis());
         }
     }
 
