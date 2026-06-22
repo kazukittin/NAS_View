@@ -8,6 +8,10 @@ import android.net.Uri;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
+import android.security.keystore.KeyGenParameterSpec;
+import android.security.keystore.KeyProperties;
+import android.text.InputType;
+import android.util.Base64;
 import android.view.GestureDetector;
 import android.view.Gravity;
 import android.view.MotionEvent;
@@ -41,19 +45,34 @@ import com.hierynomus.smbj.share.File;
 import java.io.ByteArrayOutputStream;
 import java.io.InputStream;
 import java.io.OutputStream;
+import java.net.Inet4Address;
+import java.net.InetAddress;
+import java.net.NetworkInterface;
+import java.net.Socket;
+import java.net.InetSocketAddress;
+import java.nio.charset.StandardCharsets;
+import java.security.KeyStore;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Comparator;
+import java.util.Enumeration;
 import java.util.EnumSet;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Properties;
+import java.util.concurrent.Callable;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipInputStream;
+
+import javax.crypto.Cipher;
+import javax.crypto.KeyGenerator;
+import javax.crypto.SecretKey;
+import javax.crypto.spec.GCMParameterSpec;
 
 import jcifs.CIFSContext;
 import jcifs.config.PropertyConfiguration;
@@ -64,8 +83,10 @@ import jcifs.smb.SmbFile;
 public class MainActivity extends Activity {
     private static final String PREFS_NAME = "nas";
     private static final String DEFAULT_HOST_PREFIX = "192.168.";
-    private static final String FIXED_USER_NAME = "ririnnba8";
-    private static final String FIXED_PASSWORD = "Hatarakuotoko8";
+    private static final String KEYSTORE_ALIAS = "nas_view_credentials";
+    private static final String CREDENTIAL_SEPARATOR = "\u0000";
+    private static final int SMB_PORT = 445;
+    private static final int DISCOVERY_TIMEOUT_MS = 180;
     private static final int MAX_SCAN_DEPTH = 64;
     private static final int MAX_SCAN_ITEMS = 5000;
     private static final int SCREEN_CONNECTION = 0;
@@ -85,11 +106,18 @@ public class MainActivity extends Activity {
 
     private final ExecutorService executor = Executors.newSingleThreadExecutor();
     private final ExecutorService thumbnailExecutor = Executors.newFixedThreadPool(2);
+    private final ExecutorService discoveryExecutor = Executors.newSingleThreadExecutor();
     private LinearLayout root;
     private ProgressBar progress;
     private ScrollView contentScroll;
     private GridLayout currentGrid;
     private EditText hostInput;
+    private EditText userInput;
+    private EditText passwordInput;
+    private LinearLayout discoveryResults;
+    private TextView discoveryStatus;
+    private Button discoveryButton;
+    private int discoveryGeneration = 0;
     private final boolean scanAllFolders = true;
     private final boolean allSharesMode = true;
     private String currentPath = "";
@@ -118,6 +146,7 @@ public class MainActivity extends Activity {
     protected void onDestroy() {
         executor.shutdownNow();
         thumbnailExecutor.shutdownNow();
+        discoveryExecutor.shutdownNow();
         super.onDestroy();
     }
 
@@ -157,11 +186,12 @@ public class MainActivity extends Activity {
             return false;
         }
 
-        config = new NasConfig(
-                host,
-                FIXED_USER_NAME,
-                FIXED_PASSWORD
-        );
+        Credentials credentials = loadCredentials();
+        if (credentials == null) {
+            return false;
+        }
+
+        config = new NasConfig(host, credentials.user, credentials.password);
         currentPath = "";
         showBrowser();
         return true;
@@ -186,8 +216,27 @@ public class MainActivity extends Activity {
         }
         hostInput = input("\u30db\u30b9\u30c8\u540d\u307e\u305f\u306fIP \u4f8b: 192.168.**.*", savedHost);
 
+        Button discover = primaryButton("NAS\u3092\u81ea\u52d5\u691c\u7d22");
+        discover.setOnClickListener(v -> startNasDiscovery());
+        discoveryButton = discover;
+        root.addView(discover);
+
+        discoveryStatus = label("\u540c\u3058Wi-Fi\u307e\u305f\u306fLAN\u4e0a\u306eNAS\u3092\u691c\u7d22\u3067\u304d\u307e\u3059\u3002");
+        root.addView(discoveryStatus);
+        discoveryResults = new LinearLayout(this);
+        discoveryResults.setOrientation(LinearLayout.VERTICAL);
+        root.addView(discoveryResults);
+
+        root.addView(label("\u307e\u305f\u306f\u63a5\u7d9a\u5148\u3092\u624b\u5165\u529b"));
         root.addView(hostInput);
-        root.addView(label("NAS\u4e0a\u306e\u5168\u5171\u6709\u30d5\u30a9\u30eb\u30c0\u3092\u81ea\u52d5\u53d6\u5f97\u3057\u307e\u3059\u3002"));
+
+        Credentials savedCredentials = loadCredentials();
+        userInput = input("\u30e6\u30fc\u30b6\u30fc\u540d", savedCredentials == null ? "" : savedCredentials.user);
+        passwordInput = input("\u30d1\u30b9\u30ef\u30fc\u30c9", savedCredentials == null ? "" : savedCredentials.password);
+        passwordInput.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_PASSWORD);
+        root.addView(userInput);
+        root.addView(passwordInput);
+        root.addView(label("\u8a8d\u8a3c\u60c5\u5831\u306f\u521d\u56de\u3060\u3051\u5165\u529b\u3057\u3001\u7aef\u672b\u5185\u306b\u6697\u53f7\u5316\u3057\u3066\u4fdd\u5b58\u3057\u307e\u3059\u3002"));
 
         Button connect = primaryButton("\u63a5\u7d9a");
         connect.setOnClickListener(v -> connectFromForm());
@@ -206,18 +255,27 @@ public class MainActivity extends Activity {
     }
 
     private void connectFromForm() {
+        String host = hostInput.getText().toString().trim();
+        String user = userInput.getText().toString().trim();
+        String password = passwordInput.getText().toString();
+        if (host.isEmpty() || user.isEmpty() || password.isEmpty()) {
+            discoveryStatus.setText("\u63a5\u7d9a\u5148\u3001\u30e6\u30fc\u30b6\u30fc\u540d\u3001\u30d1\u30b9\u30ef\u30fc\u30c9\u3092\u5165\u529b\u3057\u3066\u304f\u3060\u3055\u3044\u3002");
+            return;
+        }
         cachedShareNames.clear();
-        config = new NasConfig(
-                hostInput.getText().toString().trim(),
-                FIXED_USER_NAME,
-                FIXED_PASSWORD
-        );
+        config = new NasConfig(host, user, password);
         currentPath = "";
-        saveConnectionSettings();
+        try {
+            saveConnectionSettings();
+        } catch (Exception e) {
+            showConnection("\u8a8d\u8a3c\u60c5\u5831\u3092\u5b89\u5168\u306b\u4fdd\u5b58\u3067\u304d\u307e\u305b\u3093\u3067\u3057\u305f\u3002");
+            return;
+        }
         showBrowser();
     }
 
-    private void saveConnectionSettings() {
+    private void saveConnectionSettings() throws Exception {
+        saveCredentials(config.user, config.password);
         getSharedPreferences(PREFS_NAME, MODE_PRIVATE).edit()
                 .putString("host", config.host)
                 .putString("path", currentPath)
@@ -225,12 +283,217 @@ public class MainActivity extends Activity {
     }
 
     private void clearSavedConnection() {
+        discoveryGeneration++;
         cachedShareNames.clear();
         clearVisibleThumbnailCache();
         getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
                 .edit()
                 .clear()
                 .apply();
+        deleteCredentialKey();
+    }
+
+    private void startNasDiscovery() {
+        final int generation = ++discoveryGeneration;
+        discoveryButton.setEnabled(false);
+        discoveryResults.removeAllViews();
+        discoveryStatus.setText("NAS\u3092\u691c\u7d22\u4e2d\u3067\u3059\u2026");
+
+        discoveryExecutor.execute(() -> {
+            String subnetPrefix = findLocalSubnetPrefix();
+            if (subnetPrefix == null) {
+                runOnUiThread(() -> finishDiscoveryWithMessage(
+                        generation,
+                        "\u63a5\u7d9a\u4e2d\u306eIPv4\u30cd\u30c3\u30c8\u30ef\u30fc\u30af\u3092\u78ba\u8a8d\u3067\u304d\u307e\u305b\u3093\u3067\u3057\u305f\u3002"
+                ));
+                return;
+            }
+
+            ArrayList<String> hosts = scanSmbHosts(subnetPrefix);
+            runOnUiThread(() -> renderDiscoveredHosts(generation, hosts));
+        });
+    }
+
+    private void finishDiscoveryWithMessage(int generation, String message) {
+        if (screenState != SCREEN_CONNECTION || generation != discoveryGeneration) {
+            return;
+        }
+        discoveryButton.setEnabled(true);
+        discoveryStatus.setText(message);
+    }
+
+    private void renderDiscoveredHosts(int generation, List<String> hosts) {
+        if (screenState != SCREEN_CONNECTION || generation != discoveryGeneration) {
+            return;
+        }
+        discoveryButton.setEnabled(true);
+        discoveryResults.removeAllViews();
+        if (hosts.isEmpty()) {
+            discoveryStatus.setText("NAS\u5019\u88dc\u304c\u898b\u3064\u304b\u308a\u307e\u305b\u3093\u3067\u3057\u305f\u3002\u63a5\u7d9a\u5148\u3092\u624b\u5165\u529b\u3057\u3066\u304f\u3060\u3055\u3044\u3002");
+            return;
+        }
+
+        discoveryStatus.setText("\u898b\u3064\u304b\u3063\u305f\u63a5\u7d9a\u5019\u88dc\uff08\u30bf\u30c3\u30d7\u3067\u63a5\u7d9a\uff09");
+        for (String host : hosts) {
+            Button candidate = primaryButton("NAS  " + host);
+            candidate.setOnClickListener(v -> selectDiscoveredHost(host));
+            discoveryResults.addView(candidate);
+        }
+    }
+
+    private void selectDiscoveredHost(String host) {
+        hostInput.setText(host);
+        if (userInput.getText().toString().trim().isEmpty()
+                || passwordInput.getText().toString().isEmpty()) {
+            discoveryStatus.setText("\u521d\u56de\u306e\u307f\u3001\u4e0b\u306e\u8a8d\u8a3c\u60c5\u5831\u3092\u5165\u529b\u3057\u3066\u300c\u63a5\u7d9a\u300d\u3092\u62bc\u3057\u3066\u304f\u3060\u3055\u3044\u3002");
+            userInput.requestFocus();
+            return;
+        }
+        connectFromForm();
+    }
+
+    private String findLocalSubnetPrefix() {
+        try {
+            Enumeration<NetworkInterface> interfaces = NetworkInterface.getNetworkInterfaces();
+            String fallback = null;
+            while (interfaces.hasMoreElements()) {
+                NetworkInterface network = interfaces.nextElement();
+                if (!network.isUp() || network.isLoopback()) {
+                    continue;
+                }
+                Enumeration<InetAddress> addresses = network.getInetAddresses();
+                while (addresses.hasMoreElements()) {
+                    InetAddress address = addresses.nextElement();
+                    if (!(address instanceof Inet4Address) || address.isLoopbackAddress()) {
+                        continue;
+                    }
+                    String hostAddress = address.getHostAddress();
+                    int lastDot = hostAddress.lastIndexOf('.');
+                    if (lastDot <= 0) {
+                        continue;
+                    }
+                    String prefix = hostAddress.substring(0, lastDot + 1);
+                    if (address.isSiteLocalAddress()) {
+                        return prefix;
+                    }
+                    fallback = prefix;
+                }
+            }
+            return fallback;
+        } catch (Exception ignored) {
+            return null;
+        }
+    }
+
+    private ArrayList<String> scanSmbHosts(String subnetPrefix) {
+        ExecutorService scanner = Executors.newFixedThreadPool(32);
+        ArrayList<Future<String>> futures = new ArrayList<>();
+        for (int suffix = 1; suffix <= 254; suffix++) {
+            final String host = subnetPrefix + suffix;
+            futures.add(scanner.submit((Callable<String>) () -> isSmbHost(host) ? host : null));
+        }
+        scanner.shutdown();
+
+        ArrayList<String> hosts = new ArrayList<>();
+        for (Future<String> future : futures) {
+            try {
+                String host = future.get();
+                if (host != null) {
+                    hosts.add(host);
+                }
+            } catch (Exception ignored) {
+                // A single unreachable address should not stop discovery.
+            }
+        }
+        return hosts;
+    }
+
+    private boolean isSmbHost(String host) {
+        try (Socket socket = new Socket()) {
+            socket.connect(new InetSocketAddress(host, SMB_PORT), DISCOVERY_TIMEOUT_MS);
+            return true;
+        } catch (Exception ignored) {
+            return false;
+        }
+    }
+
+    private void saveCredentials(String user, String password) throws Exception {
+        Cipher cipher = Cipher.getInstance("AES/GCM/NoPadding");
+        cipher.init(Cipher.ENCRYPT_MODE, getOrCreateCredentialKey());
+        byte[] plaintext = (user + CREDENTIAL_SEPARATOR + password).getBytes(StandardCharsets.UTF_8);
+        byte[] encrypted = cipher.doFinal(plaintext);
+        getSharedPreferences(PREFS_NAME, MODE_PRIVATE).edit()
+                .putString("credentials_iv", Base64.encodeToString(cipher.getIV(), Base64.NO_WRAP))
+                .putString("credentials_data", Base64.encodeToString(encrypted, Base64.NO_WRAP))
+                .apply();
+    }
+
+    private Credentials loadCredentials() {
+        SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
+        String ivText = prefs.getString("credentials_iv", "");
+        String dataText = prefs.getString("credentials_data", "");
+        if (ivText.isEmpty() || dataText.isEmpty()) {
+            return null;
+        }
+        try {
+            Cipher cipher = Cipher.getInstance("AES/GCM/NoPadding");
+            cipher.init(
+                    Cipher.DECRYPT_MODE,
+                    getOrCreateCredentialKey(),
+                    new GCMParameterSpec(128, Base64.decode(ivText, Base64.NO_WRAP))
+            );
+            String plaintext = new String(
+                    cipher.doFinal(Base64.decode(dataText, Base64.NO_WRAP)),
+                    StandardCharsets.UTF_8
+            );
+            int separator = plaintext.indexOf(CREDENTIAL_SEPARATOR);
+            if (separator < 0) {
+                return null;
+            }
+            return new Credentials(
+                    plaintext.substring(0, separator),
+                    plaintext.substring(separator + CREDENTIAL_SEPARATOR.length())
+            );
+        } catch (Exception ignored) {
+            prefs.edit()
+                    .remove("credentials_iv")
+                    .remove("credentials_data")
+                    .apply();
+            return null;
+        }
+    }
+
+    private SecretKey getOrCreateCredentialKey() throws Exception {
+        KeyStore keyStore = KeyStore.getInstance("AndroidKeyStore");
+        keyStore.load(null);
+        java.security.Key existing = keyStore.getKey(KEYSTORE_ALIAS, null);
+        if (existing instanceof SecretKey) {
+            return (SecretKey) existing;
+        }
+
+        KeyGenerator generator = KeyGenerator.getInstance(
+                KeyProperties.KEY_ALGORITHM_AES,
+                "AndroidKeyStore"
+        );
+        generator.init(new KeyGenParameterSpec.Builder(
+                KEYSTORE_ALIAS,
+                KeyProperties.PURPOSE_ENCRYPT | KeyProperties.PURPOSE_DECRYPT
+        ).setBlockModes(KeyProperties.BLOCK_MODE_GCM)
+                .setEncryptionPaddings(KeyProperties.ENCRYPTION_PADDING_NONE)
+                .build());
+        return generator.generateKey();
+    }
+
+    private void deleteCredentialKey() {
+        try {
+            KeyStore keyStore = KeyStore.getInstance("AndroidKeyStore");
+            keyStore.load(null);
+            if (keyStore.containsAlias(KEYSTORE_ALIAS)) {
+                keyStore.deleteEntry(KEYSTORE_ALIAS);
+            }
+        } catch (Exception ignored) {
+            // Preferences are already cleared; a stale key contains no credential data.
+        }
     }
 
     private void showBrowser() {
@@ -1562,6 +1825,16 @@ public class MainActivity extends Activity {
 
         NasConfig(String host, String user, String password) {
             this.host = host;
+            this.user = user;
+            this.password = password;
+        }
+    }
+
+    private static class Credentials {
+        final String user;
+        final String password;
+
+        Credentials(String user, String password) {
             this.user = user;
             this.password = password;
         }
