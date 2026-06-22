@@ -10,7 +10,9 @@ import android.os.Handler;
 import android.os.Looper;
 import android.security.keystore.KeyGenParameterSpec;
 import android.security.keystore.KeyProperties;
+import android.text.Editable;
 import android.text.InputType;
+import android.text.TextWatcher;
 import android.util.Base64;
 import android.view.GestureDetector;
 import android.view.Gravity;
@@ -43,13 +45,17 @@ import com.hierynomus.smbj.share.DiskShare;
 import com.hierynomus.smbj.share.File;
 
 import java.io.ByteArrayOutputStream;
+import java.io.BufferedReader;
+import java.io.InputStreamReader;
 import java.io.InputStream;
 import java.io.OutputStream;
 import java.net.Inet4Address;
 import java.net.InetAddress;
 import java.net.NetworkInterface;
+import java.net.ServerSocket;
 import java.net.Socket;
 import java.net.InetSocketAddress;
+import java.net.SocketTimeoutException;
 import java.nio.charset.StandardCharsets;
 import java.security.KeyStore;
 import java.util.ArrayList;
@@ -58,14 +64,20 @@ import java.util.Comparator;
 import java.util.Enumeration;
 import java.util.EnumSet;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
 import java.util.Properties;
+import java.util.Set;
 import java.util.concurrent.Callable;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipInputStream;
 
@@ -99,14 +111,19 @@ public class MainActivity extends Activity {
     private static final int SWIPE_MAX_OFF_PATH_DP = 80;
     private static final int INITIAL_TILE_LIMIT = 60;
     private static final int LOAD_MORE_TILE_COUNT = 60;
+    private static final long DIRECTORY_CACHE_TTL_MS = 15_000L;
+    private static final int DIRECTORY_CACHE_MAX_ENTRIES = 20;
     private static final int MEDIA_IMAGE = 1;
     private static final int MEDIA_VIDEO = 2;
     private static final int MEDIA_AUDIO = 3;
     private static final int VIDEO_CONTROLS_AUTO_HIDE_MS = 3200;
+    private static final int STREAM_BUFFER_SIZE = 256 * 1024;
+    private static final int HISTORY_MAX_ENTRIES = 20;
 
     private final ExecutorService executor = Executors.newSingleThreadExecutor();
     private final ExecutorService thumbnailExecutor = Executors.newFixedThreadPool(2);
     private final ExecutorService discoveryExecutor = Executors.newSingleThreadExecutor();
+    private final ExecutorService directoryExecutor = Executors.newFixedThreadPool(2);
     private LinearLayout root;
     private ProgressBar progress;
     private ScrollView contentScroll;
@@ -127,12 +144,28 @@ public class MainActivity extends Activity {
     private List<RemoteItem> currentRenderedItems = new ArrayList<>();
     private ArrayList<String> cachedShareNames = new ArrayList<>();
     private HashMap<String, Bitmap> visibleThumbnailCache = new HashMap<>();
+    private final Set<ThumbnailLoad> activeThumbnailLoads = ConcurrentHashMap.newKeySet();
+    private final LinkedHashMap<String, DirectoryCacheEntry> directoryCache =
+            new LinkedHashMap<String, DirectoryCacheEntry>(16, 0.75f, true) {
+                @Override
+                protected boolean removeEldestEntry(Map.Entry<String, DirectoryCacheEntry> eldest) {
+                    return size() > DIRECTORY_CACHE_MAX_ENTRIES;
+                }
+            };
     private int thumbnailGeneration = 0;
     private int viewerGeneration = 0;
     private int mediaDirectoryGeneration = 0;
     private int displayedTileCount = 0;
+    private int contentHeaderCount = 1;
     private int screenState = SCREEN_CONNECTION;
+    private String currentSearchQuery = "";
+    private int currentSortMode = 0;
     private NasConfig config;
+    private DirectoryLoad currentDirectoryLoad;
+    private final SmbSessionPool smbSessionPool = new SmbSessionPool();
+    private LocalStreamServer currentStreamServer;
+    private VideoView currentPlayer;
+    private RemoteItem currentPlayingItem;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -144,10 +177,28 @@ public class MainActivity extends Activity {
 
     @Override
     protected void onDestroy() {
+        stopCurrentStream();
+        cancelCurrentDirectoryLoad();
+        cancelThumbnailLoads();
+        smbSessionPool.close();
         executor.shutdownNow();
         thumbnailExecutor.shutdownNow();
         discoveryExecutor.shutdownNow();
+        directoryExecutor.shutdownNow();
         super.onDestroy();
+    }
+
+    @Override
+    protected void onPause() {
+        rememberCurrentFolderPosition();
+        if (currentPlayer != null && currentPlayingItem != null) {
+            try {
+                savePlaybackPosition(currentPlayingItem, currentPlayer.getCurrentPosition());
+            } catch (Exception ignored) {
+                // Playback state will be saved again when the viewer closes.
+            }
+        }
+        super.onPause();
     }
 
     @Override
@@ -156,7 +207,7 @@ public class MainActivity extends Activity {
             if (currentShareName == null || currentShareName.isEmpty()) {
                 showBrowser();
             } else {
-                showMediaList(currentShareName);
+                showMediaDirectory(currentShareName, currentMediaPath);
             }
             return;
         }
@@ -193,11 +244,20 @@ public class MainActivity extends Activity {
 
         config = new NasConfig(host, credentials.user, credentials.password);
         currentPath = "";
-        showBrowser();
+        String lastShare = prefs.getString("last_share", "");
+        String lastPath = prefs.getString("last_path", "");
+        if (lastShare.isEmpty()) {
+            showBrowser();
+        } else {
+            showMediaDirectory(lastShare, lastPath);
+        }
         return true;
     }
 
     private void showConnection(String message) {
+        stopCurrentStream();
+        cancelCurrentDirectoryLoad();
+        leaveThumbnailScreen();
         screenState = SCREEN_CONNECTION;
         root = baseRoot();
         SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
@@ -262,16 +322,36 @@ public class MainActivity extends Activity {
             discoveryStatus.setText("\u63a5\u7d9a\u5148\u3001\u30e6\u30fc\u30b6\u30fc\u540d\u3001\u30d1\u30b9\u30ef\u30fc\u30c9\u3092\u5165\u529b\u3057\u3066\u304f\u3060\u3055\u3044\u3002");
             return;
         }
-        cachedShareNames.clear();
-        config = new NasConfig(host, user, password);
-        currentPath = "";
-        try {
-            saveConnectionSettings();
-        } catch (Exception e) {
-            showConnection("\u8a8d\u8a3c\u60c5\u5831\u3092\u5b89\u5168\u306b\u4fdd\u5b58\u3067\u304d\u307e\u305b\u3093\u3067\u3057\u305f\u3002");
-            return;
-        }
-        showBrowser();
+        NasConfig candidate = new NasConfig(host, user, password);
+        discoveryStatus.setText("\u63a5\u7d9a\u3092\u78ba\u8a8d\u4e2d\u3067\u3059\u2026");
+        userInput.setEnabled(false);
+        passwordInput.setEnabled(false);
+        hostInput.setEnabled(false);
+        executor.execute(() -> {
+            try {
+                ArrayList<String> shareNames = listShareNames(candidate);
+                runOnUiThread(() -> {
+                    config = candidate;
+                    smbSessionPool.reset();
+                    cachedShareNames = new ArrayList<>(shareNames);
+                    clearDirectoryCache();
+                    currentPath = "";
+                    try {
+                        saveConnectionSettings();
+                        showBrowser();
+                    } catch (Exception e) {
+                        showConnection("\u63a5\u7d9a\u306f\u6210\u529f\u3057\u307e\u3057\u305f\u304c\u3001\u8a8d\u8a3c\u60c5\u5831\u3092\u5b89\u5168\u306b\u4fdd\u5b58\u3067\u304d\u307e\u305b\u3093\u3067\u3057\u305f\u3002");
+                    }
+                });
+            } catch (Exception e) {
+                runOnUiThread(() -> {
+                    hostInput.setEnabled(true);
+                    userInput.setEnabled(true);
+                    passwordInput.setEnabled(true);
+                    discoveryStatus.setText(errorMessageFor(e));
+                });
+            }
+        });
     }
 
     private void saveConnectionSettings() throws Exception {
@@ -279,18 +359,22 @@ public class MainActivity extends Activity {
         getSharedPreferences(PREFS_NAME, MODE_PRIVATE).edit()
                 .putString("host", config.host)
                 .putString("path", currentPath)
+                .remove("last_share")
+                .remove("last_path")
                 .apply();
     }
 
     private void clearSavedConnection() {
         discoveryGeneration++;
         cachedShareNames.clear();
+        clearDirectoryCache();
         clearVisibleThumbnailCache();
         getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
                 .edit()
                 .clear()
                 .apply();
         deleteCredentialKey();
+        smbSessionPool.reset();
     }
 
     private void startNasDiscovery() {
@@ -497,11 +581,12 @@ public class MainActivity extends Activity {
     }
 
     private void showBrowser() {
+        stopCurrentStream();
+        cancelCurrentDirectoryLoad();
+        leaveThumbnailScreen();
         screenState = SCREEN_SHARES;
         currentShareName = "";
         mediaDirectoryGeneration++;
-        thumbnailGeneration++;
-        clearVisibleThumbnailCache();
         currentGrid = null;
         currentRenderedItems = new ArrayList<>();
         displayedTileCount = 0;
@@ -513,6 +598,11 @@ public class MainActivity extends Activity {
 
         Button settings = smallButton("\u63a5\u7d9a");
         settings.setOnClickListener(v -> showConnection(null));
+        Button refresh = smallButton("\u66f4\u65b0");
+        refresh.setOnClickListener(v -> {
+            cachedShareNames.clear();
+            showBrowser();
+        });
 
         TextView title = new TextView(this);
         title.setText(config.host + " \u306e\u5171\u6709\u30d5\u30a9\u30eb\u30c0");
@@ -521,6 +611,7 @@ public class MainActivity extends Activity {
         title.setPadding(dp(10), 0, 0, 0);
         bar.addView(settings);
         bar.addView(title, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1));
+        bar.addView(refresh);
         root.addView(bar);
 
         progress = new ProgressBar(this);
@@ -546,6 +637,7 @@ public class MainActivity extends Activity {
 
     private void renderShareNames(List<String> shareNames) {
         root.removeView(progress);
+        renderSavedShortcuts();
         if (shareNames.isEmpty()) {
             root.addView(label("\u8868\u793a\u3067\u304d\u308b\u5171\u6709\u30d5\u30a9\u30eb\u30c0\u304c\u898b\u3064\u304b\u308a\u307e\u305b\u3093\u3002"));
             return;
@@ -564,20 +656,34 @@ public class MainActivity extends Activity {
     private void showMediaList(String shareName) {
         screenState = SCREEN_MEDIA;
         currentShareName = shareName;
-        thumbnailGeneration++;
-        clearVisibleThumbnailCache();
         currentMediaPath = "";
         currentPath = "";
         showMediaDirectory(shareName, "");
     }
 
     private void showMediaDirectory(String shareName, String path) {
+        boolean sameFolder = shareName.equals(currentShareName) && path.equals(currentMediaPath);
+        rememberCurrentFolderPosition();
+        stopCurrentStream();
+        cancelCurrentDirectoryLoad();
+        leaveThumbnailScreen();
         screenState = SCREEN_MEDIA;
         currentShareName = shareName;
         currentMediaPath = path;
+        if (!sameFolder) {
+            currentSearchQuery = "";
+        }
+        addHistory(new RemoteItem(
+                shareName,
+                path.isEmpty() ? shareName : lastPathSegment(path),
+                path,
+                true
+        ));
+        getSharedPreferences(PREFS_NAME, MODE_PRIVATE).edit()
+                .putString("last_share", shareName)
+                .putString("last_path", path)
+                .apply();
         int loadGeneration = ++mediaDirectoryGeneration;
-        thumbnailGeneration++;
-        clearVisibleThumbnailCache();
         currentMediaItems = new ArrayList<>();
         currentRenderedItems = new ArrayList<>();
         currentGrid = null;
@@ -590,6 +696,20 @@ public class MainActivity extends Activity {
 
         Button shares = smallButton("\u5171\u6709\u4e00\u89a7");
         shares.setOnClickListener(v -> showBrowser());
+        Button favorite = smallButton(isFavorite(shareName, path) ? "\u2605" : "\u2606");
+        favorite.setContentDescription("\u304a\u6c17\u306b\u5165\u308a");
+        favorite.setOnClickListener(v -> {
+            RemoteItem folder = new RemoteItem(
+                    shareName,
+                    path.isEmpty() ? shareName : lastPathSegment(path),
+                    path,
+                    true
+            );
+            toggleFavorite(folder);
+            favorite.setText(isFavorite(shareName, path) ? "\u2605" : "\u2606");
+        });
+        Button refresh = smallButton("\u66f4\u65b0");
+        refresh.setOnClickListener(v -> refreshCurrentDirectory());
 
         TextView title = new TextView(this);
         title.setText(path.isEmpty() ? shareName + " \u306e\u30e1\u30c7\u30a3\u30a2" : lastPathSegment(path));
@@ -598,31 +718,122 @@ public class MainActivity extends Activity {
         title.setPadding(dp(10), 0, 0, 0);
         bar.addView(shares);
         bar.addView(title, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1));
+        bar.addView(favorite);
+        bar.addView(refresh);
         root.addView(bar);
+
+        LinearLayout tools = new LinearLayout(this);
+        tools.setOrientation(LinearLayout.HORIZONTAL);
+        EditText search = input("\u3053\u306e\u30d5\u30a9\u30eb\u30c0\u3092\u691c\u7d22", currentSearchQuery);
+        Button sort = smallButton(sortLabel());
+        sort.setOnClickListener(v -> {
+            currentSortMode = (currentSortMode + 1) % 3;
+            sort.setText(sortLabel());
+            applyMediaFilters();
+        });
+        search.addTextChangedListener(new TextWatcher() {
+            @Override public void beforeTextChanged(CharSequence s, int start, int count, int after) {}
+            @Override public void onTextChanged(CharSequence s, int start, int before, int count) {
+                currentSearchQuery = s.toString();
+                applyMediaFilters();
+            }
+            @Override public void afterTextChanged(Editable s) {}
+        });
+        tools.addView(search, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1));
+        tools.addView(sort);
+        root.addView(tools);
+        contentHeaderCount = 2;
 
         progress = new ProgressBar(this);
         progress.setIndeterminate(true);
         root.addView(progress);
         setContentView(wrap(root));
 
-        executor.execute(() -> {
+        List<RemoteItem> cachedItems = getCachedDirectory(shareName, path);
+        if (cachedItems != null) {
+            currentMediaItems = cachedItems;
+            applyMediaFilters();
+            return;
+        }
+
+        DirectoryLoad directoryLoad = new DirectoryLoad();
+        currentDirectoryLoad = directoryLoad;
+        directoryLoad.future = directoryExecutor.submit(() -> {
             try {
-                List<RemoteItem> items = listDirectory(shareName, path);
+                List<RemoteItem> items = listDirectory(shareName, path, directoryLoad);
+                if (directoryLoad.isCancelled()) {
+                    return;
+                }
                 runOnUiThread(() -> {
-                    if (!isCurrentMediaDirectory(loadGeneration, shareName, path)) {
+                    if (directoryLoad.isCancelled()
+                            || currentDirectoryLoad != directoryLoad
+                            || !isCurrentMediaDirectory(loadGeneration, shareName, path)) {
                         return;
                     }
+                    currentDirectoryLoad = null;
+                    cacheDirectory(shareName, path, items);
                     currentMediaItems = items;
-                    renderItems(groupAudioByFolder(items));
+                    applyMediaFilters();
                 });
             } catch (Exception e) {
+                if (directoryLoad.isCancelled()) {
+                    return;
+                }
                 runOnUiThread(() -> {
-                    if (isCurrentMediaDirectory(loadGeneration, shareName, path)) {
+                    if (currentDirectoryLoad == directoryLoad
+                            && isCurrentMediaDirectory(loadGeneration, shareName, path)) {
+                        currentDirectoryLoad = null;
                         renderError(e);
                     }
                 });
+            } finally {
+                directoryLoad.closeConnection();
             }
         });
+    }
+
+    private void cancelCurrentDirectoryLoad() {
+        DirectoryLoad load = currentDirectoryLoad;
+        currentDirectoryLoad = null;
+        if (load != null) {
+            load.cancel();
+        }
+    }
+
+    private List<RemoteItem> getCachedDirectory(String shareName, String path) {
+        String key = directoryCacheKey(shareName, path);
+        synchronized (directoryCache) {
+            DirectoryCacheEntry entry = directoryCache.get(key);
+            if (entry == null) {
+                return null;
+            }
+            if (System.currentTimeMillis() - entry.savedAt > DIRECTORY_CACHE_TTL_MS) {
+                directoryCache.remove(key);
+                return null;
+            }
+            return new ArrayList<>(entry.items);
+        }
+    }
+
+    private void cacheDirectory(String shareName, String path, List<RemoteItem> items) {
+        String key = directoryCacheKey(shareName, path);
+        synchronized (directoryCache) {
+            directoryCache.put(
+                    key,
+                    new DirectoryCacheEntry(System.currentTimeMillis(), new ArrayList<>(items))
+            );
+        }
+    }
+
+    private String directoryCacheKey(String shareName, String path) {
+        String host = config == null ? "" : config.host;
+        return host + "|" + shareName + "|" + path;
+    }
+
+    private void clearDirectoryCache() {
+        synchronized (directoryCache) {
+            directoryCache.clear();
+        }
     }
 
     private boolean isCurrentMediaDirectory(int loadGeneration, String shareName, String path) {
@@ -636,6 +847,32 @@ public class MainActivity extends Activity {
         displayedTileCount = 0;
         currentGrid = null;
         renderItemsWindow(INITIAL_TILE_LIMIT);
+        restoreCurrentFolderPosition();
+    }
+
+    private void rememberCurrentFolderPosition() {
+        if (screenState != SCREEN_MEDIA || contentScroll == null
+                || currentShareName == null || currentShareName.isEmpty()) {
+            return;
+        }
+        getSharedPreferences(PREFS_NAME, MODE_PRIVATE).edit()
+                .putInt("scroll_" + folderStateKey(currentShareName, currentMediaPath), contentScroll.getScrollY())
+                .apply();
+    }
+
+    private void restoreCurrentFolderPosition() {
+        if (contentScroll == null || currentShareName == null || currentShareName.isEmpty()) {
+            return;
+        }
+        int position = getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
+                .getInt("scroll_" + folderStateKey(currentShareName, currentMediaPath), 0);
+        contentScroll.post(() -> contentScroll.scrollTo(0, position));
+    }
+
+    private String folderStateKey(String shareName, String path) {
+        String host = config == null ? "" : config.host;
+        String raw = host + "|" + shareName + "|" + path;
+        return Base64.encodeToString(raw.getBytes(StandardCharsets.UTF_8), Base64.NO_WRAP | Base64.URL_SAFE);
     }
 
     private void renderItemsWindow(int limit) {
@@ -643,16 +880,16 @@ public class MainActivity extends Activity {
             root.removeView(progress);
         }
         if (currentRenderedItems.isEmpty()) {
-            while (root.getChildCount() > 1) {
-                root.removeViewAt(1);
+            while (root.getChildCount() > contentHeaderCount) {
+                root.removeViewAt(contentHeaderCount);
             }
             root.addView(label("\u5bfe\u5fdc\u3057\u3066\u3044\u308b\u30e1\u30c7\u30a3\u30a2\u304c\u898b\u3064\u304b\u308a\u307e\u305b\u3093\u3002"));
             return;
         }
 
         if (currentGrid == null) {
-            while (root.getChildCount() > 1) {
-                root.removeViewAt(1);
+            while (root.getChildCount() > contentHeaderCount) {
+                root.removeViewAt(contentHeaderCount);
             }
             currentGrid = new GridLayout(this);
             currentGrid.setColumnCount(2);
@@ -675,20 +912,252 @@ public class MainActivity extends Activity {
         renderItemsWindow(LOAD_MORE_TILE_COUNT);
     }
 
+    private void applyMediaFilters() {
+        thumbnailGeneration++;
+        cancelThumbnailLoads();
+        ArrayList<RemoteItem> filtered = new ArrayList<>();
+        String query = currentSearchQuery.trim().toLowerCase(Locale.ROOT);
+        for (RemoteItem item : groupAudioByFolder(currentMediaItems)) {
+            if (query.isEmpty()
+                    || item.name.toLowerCase(Locale.ROOT).contains(query)
+                    || item.path.toLowerCase(Locale.ROOT).contains(query)) {
+                filtered.add(item);
+            }
+        }
+        Comparator<RemoteItem> comparator;
+        if (currentSortMode == 1) {
+            comparator = (a, b) -> b.name.compareToIgnoreCase(a.name);
+        } else if (currentSortMode == 2) {
+            comparator = Comparator
+                    .comparingInt((RemoteItem item) -> item.directory ? 0 : mediaSortOrder(item.name))
+                    .thenComparing(item -> item.name.toLowerCase(Locale.ROOT));
+        } else {
+            comparator = (a, b) -> a.name.compareToIgnoreCase(b.name);
+        }
+        Collections.sort(filtered, (a, b) -> {
+            if (a.directory != b.directory) {
+                return a.directory ? -1 : 1;
+            }
+            return comparator.compare(a, b);
+        });
+        renderItems(filtered);
+    }
+
+    private int mediaSortOrder(String name) {
+        if (isImage(name)) return 1;
+        if (isZip(name)) return 2;
+        if (isVideo(name)) return 3;
+        if (isAudio(name)) return 4;
+        return 5;
+    }
+
+    private String sortLabel() {
+        if (currentSortMode == 1) return "\u540d\u524d \u2193";
+        if (currentSortMode == 2) return "\u7a2e\u985e\u9806";
+        return "\u540d\u524d \u2191";
+    }
+
+    private void refreshCurrentDirectory() {
+        if (currentShareName == null || currentShareName.isEmpty()) {
+            cachedShareNames.clear();
+            showBrowser();
+            return;
+        }
+        synchronized (directoryCache) {
+            directoryCache.remove(directoryCacheKey(currentShareName, currentMediaPath));
+        }
+        showMediaDirectory(currentShareName, currentMediaPath);
+    }
+
+    private void renderSavedShortcuts() {
+        List<RemoteItem> favorites = favoriteItems();
+        List<RemoteItem> history = historyItems();
+        if (!favorites.isEmpty()) {
+            root.addView(label("\u304a\u6c17\u306b\u5165\u308a"));
+            renderShortcutButtons(favorites, 8);
+        }
+        if (!history.isEmpty()) {
+            root.addView(label("\u6700\u8fd1\u958b\u3044\u305f\u9805\u76ee"));
+            renderShortcutButtons(history, 6);
+        }
+    }
+
+    private void renderShortcutButtons(List<RemoteItem> items, int limit) {
+        LinearLayout shortcuts = new LinearLayout(this);
+        shortcuts.setOrientation(LinearLayout.VERTICAL);
+        for (int i = 0; i < Math.min(limit, items.size()); i++) {
+            RemoteItem item = items.get(i);
+            Button button = smallButton((item.directory ? "\u30d5\u30a9\u30eb\u30c0  " : "") + item.name);
+            button.setGravity(Gravity.START | Gravity.CENTER_VERTICAL);
+            button.setOnClickListener(v -> openItem(item));
+            shortcuts.addView(button);
+        }
+        root.addView(shortcuts);
+    }
+
+    private boolean isFavorite(String share, String path) {
+        String prefix = shortcutIdentity(share, path);
+        for (String encoded : favoriteRecords()) {
+            if (encoded.startsWith(prefix)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private void toggleFavorite(RemoteItem item) {
+        HashSet<String> records = favoriteRecords();
+        String prefix = shortcutIdentity(item.share, item.path);
+        String existing = null;
+        for (String record : records) {
+            if (record.startsWith(prefix)) {
+                existing = record;
+                break;
+            }
+        }
+        if (existing == null) {
+            records.add(encodeShortcut(item));
+        } else {
+            records.remove(existing);
+        }
+        getSharedPreferences(PREFS_NAME, MODE_PRIVATE).edit()
+                .putStringSet("favorites", records)
+                .apply();
+    }
+
+    private HashSet<String> favoriteRecords() {
+        return new HashSet<>(getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
+                .getStringSet("favorites", Collections.emptySet()));
+    }
+
+    private List<RemoteItem> favoriteItems() {
+        ArrayList<RemoteItem> items = new ArrayList<>();
+        for (String record : favoriteRecords()) {
+            RemoteItem item = decodeShortcut(record);
+            if (item != null) items.add(item);
+        }
+        Collections.sort(items, Comparator.comparing(item -> item.name.toLowerCase(Locale.ROOT)));
+        return items;
+    }
+
+    private void addHistory(RemoteItem item) {
+        String encoded = encodeShortcut(item);
+        ArrayList<String> records = historyRecords();
+        records.removeIf(record -> record.startsWith(shortcutIdentity(item.share, item.path)));
+        records.add(0, encoded);
+        if (records.size() > HISTORY_MAX_ENTRIES) {
+            records.subList(HISTORY_MAX_ENTRIES, records.size()).clear();
+        }
+        getSharedPreferences(PREFS_NAME, MODE_PRIVATE).edit()
+                .putString("history", String.join(",", records))
+                .apply();
+    }
+
+    private ArrayList<String> historyRecords() {
+        String stored = getSharedPreferences(PREFS_NAME, MODE_PRIVATE).getString("history", "");
+        ArrayList<String> records = new ArrayList<>();
+        if (stored != null && !stored.isEmpty()) {
+            Collections.addAll(records, stored.split(","));
+        }
+        return records;
+    }
+
+    private List<RemoteItem> historyItems() {
+        ArrayList<RemoteItem> items = new ArrayList<>();
+        for (String record : historyRecords()) {
+            RemoteItem item = decodeShortcut(record);
+            if (item != null) items.add(item);
+        }
+        return items;
+    }
+
+    private String shortcutIdentity(String share, String path) {
+        String host = config == null ? "" : config.host;
+        String raw = host + "\u0000" + share + "\u0000" + path + "\u0000";
+        return Base64.encodeToString(raw.getBytes(StandardCharsets.UTF_8), Base64.NO_WRAP | Base64.URL_SAFE)
+                .replace("=", "");
+    }
+
+    private String encodeShortcut(RemoteItem item) {
+        String identity = shortcutIdentity(item.share, item.path);
+        String details = item.name + "\u0000" + item.directory;
+        return identity + "." + Base64.encodeToString(
+                details.getBytes(StandardCharsets.UTF_8),
+                Base64.NO_WRAP | Base64.URL_SAFE
+        );
+    }
+
+    private RemoteItem decodeShortcut(String record) {
+        try {
+            int dot = record.indexOf('.');
+            if (dot < 0) return null;
+            String identityPart = record.substring(0, dot);
+            int padding = (4 - identityPart.length() % 4) % 4;
+            StringBuilder padded = new StringBuilder(identityPart);
+            for (int i = 0; i < padding; i++) padded.append('=');
+            String identity = new String(
+                    Base64.decode(padded.toString(), Base64.NO_WRAP | Base64.URL_SAFE),
+                    StandardCharsets.UTF_8
+            );
+            String[] fields = identity.split(CREDENTIAL_SEPARATOR, -1);
+            if (fields.length < 4 || config == null || !config.host.equals(fields[0])) return null;
+            String details = new String(
+                    Base64.decode(record.substring(dot + 1), Base64.NO_WRAP | Base64.URL_SAFE),
+                    StandardCharsets.UTF_8
+            );
+            String[] detailFields = details.split(CREDENTIAL_SEPARATOR, -1);
+            if (detailFields.length < 2) return null;
+            return new RemoteItem(fields[1], detailFields[0], fields[2], Boolean.parseBoolean(detailFields[1]));
+        } catch (Exception ignored) {
+            return null;
+        }
+    }
+
     private void renderError(Exception e) {
         if (progress != null && progress.getParent() == root) {
             root.removeView(progress);
         }
-        root.addView(label("\u63a5\u7d9a\u307e\u305f\u306f\u8aad\u307f\u8fbc\u307f\u306b\u5931\u6557\u3057\u307e\u3057\u305f\u3002"));
-        TextView detail = label(e.getMessage() == null ? e.toString() : e.getMessage());
+        root.addView(label(errorMessageFor(e)));
+        TextView detail = label(e.getMessage() == null ? e.getClass().getSimpleName() : e.getMessage());
         detail.setTextColor(0xff9b1c1c);
         root.addView(detail);
+        Button retry = smallButton("\u518d\u8a66\u884c");
+        retry.setOnClickListener(v -> {
+            if (screenState == SCREEN_MEDIA) {
+                refreshCurrentDirectory();
+            } else {
+                cachedShareNames.clear();
+                showBrowser();
+            }
+        });
+        root.addView(retry);
         Button edit = smallButton("\u63a5\u7d9a\u60c5\u5831\u3092\u78ba\u8a8d");
         edit.setOnClickListener(v -> showConnection("\u63a5\u7d9a\u3067\u304d\u307e\u305b\u3093\u3067\u3057\u305f\u3002\u63a5\u7d9a\u60c5\u5831\u3092\u78ba\u8a8d\u3057\u3066\u304f\u3060\u3055\u3044\u3002"));
         root.addView(edit);
     }
 
+    private String errorMessageFor(Exception e) {
+        String text = ((e.getMessage() == null ? "" : e.getMessage()) + " "
+                + e.getClass().getSimpleName()).toLowerCase(Locale.ROOT);
+        if (text.contains("auth") || text.contains("logon") || text.contains("password")
+                || text.contains("access_denied") || text.contains("status_logon_failure")) {
+            return "\u8a8d\u8a3c\u306b\u5931\u6557\u3057\u307e\u3057\u305f\u3002\u30e6\u30fc\u30b6\u30fc\u540d\u3068\u30d1\u30b9\u30ef\u30fc\u30c9\u3092\u78ba\u8a8d\u3057\u3066\u304f\u3060\u3055\u3044\u3002";
+        }
+        if (text.contains("denied") || text.contains("permission")) {
+            return "\u3053\u306e\u30d5\u30a9\u30eb\u30c0\u3092\u958b\u304f\u6a29\u9650\u304c\u3042\u308a\u307e\u305b\u3093\u3002";
+        }
+        if (text.contains("timeout") || e instanceof SocketTimeoutException) {
+            return "NAS\u304b\u3089\u306e\u5fdc\u7b54\u304c\u306a\u3044\u305f\u3081\u30bf\u30a4\u30e0\u30a2\u30a6\u30c8\u3057\u307e\u3057\u305f\u3002";
+        }
+        if (text.contains("unreachable") || text.contains("refused")
+                || text.contains("unknownhost") || text.contains("connect")) {
+            return "NAS\u306b\u63a5\u7d9a\u3067\u304d\u307e\u305b\u3093\u3002Wi-Fi\u3068NAS\u306e\u96fb\u6e90\u3092\u78ba\u8a8d\u3057\u3066\u304f\u3060\u3055\u3044\u3002";
+        }
+        return "\u63a5\u7d9a\u307e\u305f\u306f\u8aad\u307f\u8fbc\u307f\u306b\u5931\u6557\u3057\u307e\u3057\u305f\u3002";
+    }
+
     private void openItem(RemoteItem item) {
+        addHistory(item);
         if (item.directory) {
             if (item.audioGroup) {
                 renderAudioFolder(item);
@@ -714,9 +1183,9 @@ public class MainActivity extends Activity {
     }
 
     private void renderAudioFolder(RemoteItem folder) {
+        rememberCurrentFolderPosition();
+        leaveThumbnailScreen();
         screenState = SCREEN_AUDIO_FOLDER;
-        thumbnailGeneration++;
-        clearVisibleThumbnailCache();
         root = baseRoot();
         LinearLayout bar = new LinearLayout(this);
         bar.setOrientation(LinearLayout.HORIZONTAL);
@@ -733,6 +1202,7 @@ public class MainActivity extends Activity {
         bar.addView(back);
         bar.addView(title, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1));
         root.addView(bar);
+        contentHeaderCount = 1;
         setContentView(wrap(root));
 
         ArrayList<RemoteItem> audioItems = new ArrayList<>();
@@ -747,9 +1217,8 @@ public class MainActivity extends Activity {
     }
 
     private void showCurrentMediaOverview() {
+        leaveThumbnailScreen();
         screenState = SCREEN_MEDIA;
-        thumbnailGeneration++;
-        clearVisibleThumbnailCache();
         root = baseRoot();
         LinearLayout bar = new LinearLayout(this);
         bar.setOrientation(LinearLayout.HORIZONTAL);
@@ -766,11 +1235,15 @@ public class MainActivity extends Activity {
         bar.addView(shares);
         bar.addView(title, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1));
         root.addView(bar);
+        contentHeaderCount = 1;
         setContentView(wrap(root));
         renderItems(groupAudioByFolder(currentMediaItems));
     }
 
     private void showImage(RemoteItem item) {
+        rememberCurrentFolderPosition();
+        stopCurrentStream();
+        leaveThumbnailScreen();
         screenState = SCREEN_VIEWER;
         viewerGeneration++;
         FrameLayout frame = viewerFrame(item.name);
@@ -821,22 +1294,26 @@ public class MainActivity extends Activity {
     }
 
     private void showPlayer(RemoteItem item) {
+        rememberCurrentFolderPosition();
+        stopCurrentStream();
+        leaveThumbnailScreen();
         screenState = SCREEN_VIEWER;
         int playerGeneration = ++viewerGeneration;
         FrameLayout frame = viewerFrame(item.name);
         ProgressBar loading = centeredProgress(frame);
         setContentView(frame);
 
-        executor.execute(() -> {
-            try {
-                java.io.File cached = copyRemoteToCache(item);
-                runOnUiThread(() -> {
-                    frame.removeView(loading);
-                    FrameLayout playerArea = new FrameLayout(this);
-                    playerArea.setBackgroundColor(0xff000000);
+        try {
+            currentStreamServer = new LocalStreamServer(item);
+            currentStreamServer.start();
+            frame.removeView(loading);
+            FrameLayout playerArea = new FrameLayout(this);
+            playerArea.setBackgroundColor(0xff000000);
 
-                    VideoView player = new ResponsiveVideoView(this);
-                    player.setVideoURI(Uri.fromFile(cached));
+            VideoView player = new ResponsiveVideoView(this);
+            currentPlayer = player;
+            currentPlayingItem = item;
+            player.setVideoURI(Uri.parse(currentStreamServer.getUrl()));
                     playerArea.addView(player, new FrameLayout.LayoutParams(
                             ViewGroup.LayoutParams.MATCH_PARENT,
                             ViewGroup.LayoutParams.MATCH_PARENT,
@@ -925,13 +1402,11 @@ public class MainActivity extends Activity {
 
                     frame.addView(playerArea, fillBelowToolbar());
                     setupVideoControlsVisibility(playerArea, controls, player, playerGeneration);
-                    setupVideoSeekControls(player, seekBar, time, playerGeneration, controls);
+                    setupVideoSeekControls(player, seekBar, time, playerGeneration, controls, item);
                     player.start();
-                });
-            } catch (Exception e) {
-                runOnUiThread(() -> showMessageInFrame(frame, loading, e));
-            }
-        });
+        } catch (Exception e) {
+            showMessageInFrame(frame, loading, e);
+        }
     }
 
     private void setupVideoControlsVisibility(View touchArea, View controls, VideoView player, int playerGeneration) {
@@ -987,7 +1462,14 @@ public class MainActivity extends Activity {
         show.run();
     }
 
-    private void setupVideoSeekControls(VideoView player, SeekBar seekBar, TextView time, int playerGeneration, View controls) {
+    private void setupVideoSeekControls(
+            VideoView player,
+            SeekBar seekBar,
+            TextView time,
+            int playerGeneration,
+            View controls,
+            RemoteItem item
+    ) {
         Handler handler = new Handler(Looper.getMainLooper());
         final boolean[] userSeeking = {false};
         Runnable[] updater = new Runnable[1];
@@ -1029,6 +1511,10 @@ public class MainActivity extends Activity {
                 ((ResponsiveVideoView) player).setVideoSize(mp.getVideoWidth(), mp.getVideoHeight());
             }
             seekBar.setMax(player.getDuration());
+            int savedPosition = getSavedPlaybackPosition(item);
+            if (savedPosition > 0 && savedPosition < player.getDuration() - 3000) {
+                player.seekTo(savedPosition);
+            }
             updater[0].run();
         });
     }
@@ -1084,7 +1570,44 @@ public class MainActivity extends Activity {
         return String.format(Locale.US, "%d:%02d", minutes, seconds);
     }
 
+    private void stopCurrentStream() {
+        if (currentPlayer != null && currentPlayingItem != null) {
+            try {
+                savePlaybackPosition(currentPlayingItem, currentPlayer.getCurrentPosition());
+                currentPlayer.stopPlayback();
+            } catch (Exception ignored) {
+                // The player may already have released its media resources.
+            }
+        }
+        currentPlayer = null;
+        currentPlayingItem = null;
+        if (currentStreamServer != null) {
+            currentStreamServer.stop();
+            currentStreamServer = null;
+        }
+    }
+
+    private void savePlaybackPosition(RemoteItem item, int position) {
+        getSharedPreferences(PREFS_NAME, MODE_PRIVATE).edit()
+                .putInt("playback_" + mediaStateKey(item), Math.max(0, position))
+                .apply();
+    }
+
+    private int getSavedPlaybackPosition(RemoteItem item) {
+        return getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
+                .getInt("playback_" + mediaStateKey(item), 0);
+    }
+
+    private String mediaStateKey(RemoteItem item) {
+        String host = config == null ? "" : config.host;
+        String raw = host + "|" + item.share + "|" + item.path;
+        return Base64.encodeToString(raw.getBytes(StandardCharsets.UTF_8), Base64.NO_WRAP | Base64.URL_SAFE);
+    }
+
     private void showZip(RemoteItem item) {
+        rememberCurrentFolderPosition();
+        stopCurrentStream();
+        leaveThumbnailScreen();
         screenState = SCREEN_VIEWER;
         viewerGeneration++;
         FrameLayout frame = viewerFrame(item.name);
@@ -1097,7 +1620,10 @@ public class MainActivity extends Activity {
                 if (pages.isEmpty()) {
                     throw new IllegalStateException("zip\u5185\u306b\u753b\u50cf\u304c\u898b\u3064\u304b\u308a\u307e\u305b\u3093\u3002");
                 }
-                runOnUiThread(() -> renderZipPage(frame, loading, item, pages, 0));
+                int savedPage = getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
+                        .getInt("zip_" + mediaStateKey(item), 0);
+                int initialPage = Math.max(0, Math.min(savedPage, pages.size() - 1));
+                runOnUiThread(() -> renderZipPage(frame, loading, item, pages, initialPage));
             } catch (Exception e) {
                 runOnUiThread(() -> showMessageInFrame(frame, loading, e));
             }
@@ -1105,6 +1631,9 @@ public class MainActivity extends Activity {
     }
 
     private void renderZipPage(FrameLayout frame, View oldView, RemoteItem item, ArrayList<String> pages, int index) {
+        getSharedPreferences(PREFS_NAME, MODE_PRIVATE).edit()
+                .putInt("zip_" + mediaStateKey(item), index)
+                .apply();
         if (oldView != null) {
             frame.removeView(oldView);
         }
@@ -1294,7 +1823,18 @@ public class MainActivity extends Activity {
         TextView name = label(item.audioGroup ? item.displayName(false) : item.name);
         name.setTextSize(13);
         name.setMaxLines(2);
-        tile.addView(name);
+        LinearLayout nameRow = new LinearLayout(this);
+        nameRow.setOrientation(LinearLayout.HORIZONTAL);
+        nameRow.setGravity(Gravity.CENTER_VERTICAL);
+        nameRow.addView(name, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1));
+        Button favorite = smallButton(isFavorite(item.share, item.path) ? "\u2605" : "\u2606");
+        favorite.setMinWidth(dp(42));
+        favorite.setOnClickListener(v -> {
+            toggleFavorite(item);
+            favorite.setText(isFavorite(item.share, item.path) ? "\u2605" : "\u2606");
+        });
+        nameRow.addView(favorite);
+        tile.addView(nameRow);
 
         TextView path = label(item.audioGroup ? item.share + "/" + item.path : item.share + "/" + parentPath(item.path));
         path.setTextSize(11);
@@ -1306,12 +1846,15 @@ public class MainActivity extends Activity {
             badge.setText("\u97f3\u58f0\u30d5\u30a9\u30eb\u30c0");
         } else if (isImage(item.name) || isZip(item.name)) {
             int generation = thumbnailGeneration;
-            thumbnailExecutor.execute(() -> {
+            ThumbnailLoad thumbnailLoad = new ThumbnailLoad();
+            activeThumbnailLoads.add(thumbnailLoad);
+            thumbnailLoad.future = thumbnailExecutor.submit(() -> {
                 try {
-                    Bitmap bitmap = loadVisibleThumbnailBitmap(item);
+                    Bitmap bitmap = loadVisibleThumbnailBitmap(item, thumbnailLoad);
                     if (bitmap != null) {
                         runOnUiThread(() -> {
-                            if (generation != thumbnailGeneration) {
+                            if (thumbnailLoad.isCancelled()
+                                    || generation != thumbnailGeneration) {
                                 return;
                             }
                             image.setImageBitmap(bitmap);
@@ -1320,6 +1863,9 @@ public class MainActivity extends Activity {
                     }
                 } catch (Exception ignored) {
                     // Leave the media-type tile when thumbnail generation fails.
+                } finally {
+                    thumbnailLoad.closeConnection();
+                    activeThumbnailLoads.remove(thumbnailLoad);
                 }
             });
         }
@@ -1354,32 +1900,44 @@ public class MainActivity extends Activity {
         return grouped;
     }
 
-    private Bitmap loadVisibleThumbnailBitmap(RemoteItem item) throws Exception {
+    private Bitmap loadVisibleThumbnailBitmap(RemoteItem item, ThumbnailLoad thumbnailLoad) throws Exception {
         String key = thumbnailKey(item);
-        Bitmap cached = visibleThumbnailCache.get(key);
+        Bitmap cached;
+        synchronized (visibleThumbnailCache) {
+            cached = visibleThumbnailCache.get(key);
+        }
         if (cached != null) {
             return cached;
         }
 
-        Bitmap generated = loadThumbnailBitmap(item);
-        if (generated != null && screenState == SCREEN_MEDIA) {
-            visibleThumbnailCache.put(key, generated);
+        Bitmap generated = loadThumbnailBitmap(item, thumbnailLoad);
+        if (generated != null
+                && !thumbnailLoad.isCancelled()
+                && screenState == SCREEN_MEDIA) {
+            synchronized (visibleThumbnailCache) {
+                visibleThumbnailCache.put(key, generated);
+            }
         }
         return generated;
     }
 
-    private Bitmap loadThumbnailBitmap(RemoteItem item) throws Exception {
-        byte[] bytes;
-        if (isZip(item.name)) {
-            ArrayList<String> pages = listZipImageEntries(item.share, item.path);
-            if (pages.isEmpty()) {
+    private Bitmap loadThumbnailBitmap(RemoteItem item, ThumbnailLoad thumbnailLoad) throws Exception {
+        return withThumbnailShare(item.share, thumbnailLoad, share -> {
+            byte[] bytes;
+            if (isZip(item.name)) {
+                ArrayList<String> pages = listZipImageEntries(share, item.path, thumbnailLoad);
+                if (pages.isEmpty() || thumbnailLoad.isCancelled()) {
+                    return null;
+                }
+                bytes = readZipEntry(share, item.path, pages.get(0), thumbnailLoad);
+            } else {
+                bytes = readRemoteFile(share, item.path, thumbnailLoad);
+            }
+            if (thumbnailLoad.isCancelled()) {
                 return null;
             }
-            bytes = readZipEntry(item.share, item.path, pages.get(0));
-        } else {
-            bytes = readRemoteFile(item.share, item.path);
-        }
-        return decodeSampledBitmap(bytes, dp(THUMBNAIL_SIZE), dp(THUMBNAIL_SIZE));
+            return decodeSampledBitmap(bytes, dp(THUMBNAIL_SIZE), dp(THUMBNAIL_SIZE));
+        });
     }
 
     private String thumbnailKey(RemoteItem item) {
@@ -1387,7 +1945,23 @@ public class MainActivity extends Activity {
     }
 
     private void clearVisibleThumbnailCache() {
-        visibleThumbnailCache.clear();
+        synchronized (visibleThumbnailCache) {
+            visibleThumbnailCache.clear();
+        }
+    }
+
+    private void leaveThumbnailScreen() {
+        thumbnailGeneration++;
+        cancelThumbnailLoads();
+        clearVisibleThumbnailCache();
+    }
+
+    private void cancelThumbnailLoads() {
+        ArrayList<ThumbnailLoad> loads = new ArrayList<>(activeThumbnailLoads);
+        activeThumbnailLoads.clear();
+        for (ThumbnailLoad load : loads) {
+            load.cancel();
+        }
     }
 
     private Bitmap decodeSampledBitmap(byte[] bytes, int reqWidth, int reqHeight) {
@@ -1409,10 +1983,33 @@ public class MainActivity extends Activity {
         return Math.max(1, inSampleSize);
     }
 
-    private List<RemoteItem> listDirectory(String shareName, String path) throws Exception {
-        return withShare(shareName, share -> {
+    private List<RemoteItem> listDirectory(
+            String shareName,
+            String path,
+            DirectoryLoad directoryLoad
+    ) throws Exception {
+        if (config == null || config.host.isEmpty() || shareName == null || shareName.isEmpty()) {
+            throw new IllegalStateException("\u30db\u30b9\u30c8\u540d\u307e\u305f\u306fIP\u3092\u5165\u529b\u3057\u3066\u304f\u3060\u3055\u3044\u3002");
+        }
+        NasConfig loadConfig = config;
+        try (SMBClient client = new SMBClient();
+             Connection connection = client.connect(loadConfig.host)) {
+            directoryLoad.attachConnection(connection);
+            AuthenticationContext auth = new AuthenticationContext(
+                    loadConfig.user,
+                    loadConfig.password.toCharArray(),
+                    null
+            );
+            Session session = connection.authenticate(auth);
+            try (DiskShare share = (DiskShare) session.connectShare(shareName)) {
+                if (directoryLoad.isCancelled()) {
+                    return Collections.emptyList();
+                }
             ArrayList<RemoteItem> items = new ArrayList<>();
             for (FileIdBothDirectoryInformation info : share.list(path)) {
+                if (directoryLoad.isCancelled()) {
+                    return Collections.emptyList();
+                }
                 String name = info.getFileName();
                 if (".".equals(name) || "..".equals(name)) {
                     continue;
@@ -1425,7 +2022,10 @@ public class MainActivity extends Activity {
             }
             sortItems(items);
             return items;
-        });
+            } finally {
+                directoryLoad.detachConnection(connection);
+            }
+        }
     }
 
     private List<RemoteItem> listAllSharesMedia() throws Exception {
@@ -1454,6 +2054,90 @@ public class MainActivity extends Activity {
             sortItems(items);
             return items;
         });
+    }
+
+    private <T> T withThumbnailShare(
+            String shareName,
+            ThumbnailLoad thumbnailLoad,
+            ShareAction<T> action
+    ) throws Exception {
+        if (config == null || config.host.isEmpty() || shareName == null || shareName.isEmpty()) {
+            throw new IllegalStateException("\u30db\u30b9\u30c8\u540d\u307e\u305f\u306fIP\u3092\u5165\u529b\u3057\u3066\u304f\u3060\u3055\u3044\u3002");
+        }
+        NasConfig loadConfig = config;
+        try (SMBClient client = new SMBClient();
+             Connection connection = client.connect(loadConfig.host)) {
+            thumbnailLoad.attachConnection(connection);
+            AuthenticationContext auth = new AuthenticationContext(
+                    loadConfig.user,
+                    loadConfig.password.toCharArray(),
+                    null
+            );
+            Session session = connection.authenticate(auth);
+            try (DiskShare share = (DiskShare) session.connectShare(shareName)) {
+                if (thumbnailLoad.isCancelled()) {
+                    return null;
+                }
+                return action.run(share);
+            } finally {
+                thumbnailLoad.detachConnection(connection);
+            }
+        }
+    }
+
+    private byte[] readRemoteFile(
+            DiskShare share,
+            String path,
+            ThumbnailLoad thumbnailLoad
+    ) throws Exception {
+        try (File file = openReadFile(share, path);
+             InputStream input = file.getInputStream();
+             ByteArrayOutputStream output = new ByteArrayOutputStream()) {
+            copy(input, output, thumbnailLoad);
+            return output.toByteArray();
+        }
+    }
+
+    private ArrayList<String> listZipImageEntries(
+            DiskShare share,
+            String path,
+            ThumbnailLoad thumbnailLoad
+    ) throws Exception {
+        ArrayList<String> names = new ArrayList<>();
+        try (File file = openReadFile(share, path);
+             ZipInputStream zip = new ZipInputStream(file.getInputStream())) {
+            ZipEntry entry;
+            while (!thumbnailLoad.isCancelled() && (entry = zip.getNextEntry()) != null) {
+                if (!entry.isDirectory() && isImage(entry.getName())) {
+                    names.add(entry.getName());
+                }
+            }
+        }
+        Collections.sort(names, Comparator.naturalOrder());
+        return names;
+    }
+
+    private byte[] readZipEntry(
+            DiskShare share,
+            String path,
+            String entryName,
+            ThumbnailLoad thumbnailLoad
+    ) throws Exception {
+        try (File file = openReadFile(share, path);
+             ZipInputStream zip = new ZipInputStream(file.getInputStream());
+             ByteArrayOutputStream output = new ByteArrayOutputStream()) {
+            ZipEntry entry;
+            while (!thumbnailLoad.isCancelled() && (entry = zip.getNextEntry()) != null) {
+                if (entryName.equals(entry.getName())) {
+                    copy(zip, output, thumbnailLoad);
+                    return output.toByteArray();
+                }
+            }
+        }
+        if (thumbnailLoad.isCancelled()) {
+            return new byte[0];
+        }
+        throw new IllegalStateException("\u30da\u30fc\u30b8\u304c\u898b\u3064\u304b\u308a\u307e\u305b\u3093: " + entryName);
     }
 
     private void scanMediaTree(String shareName, DiskShare share, String path, ArrayList<RemoteItem> items, int depth) {
@@ -1485,18 +2169,6 @@ public class MainActivity extends Activity {
                 copy(input, output);
                 return output.toByteArray();
             }
-        });
-    }
-
-    private java.io.File copyRemoteToCache(RemoteItem item) throws Exception {
-        return withShare(item.share, share -> {
-            java.io.File cached = new java.io.File(getCacheDir(), safeCacheName(item.name));
-            try (File file = openReadFile(share, item.path);
-                 InputStream input = file.getInputStream();
-                 OutputStream output = new java.io.FileOutputStream(cached)) {
-                copy(input, output);
-            }
-            return cached;
         });
     }
 
@@ -1545,8 +2217,181 @@ public class MainActivity extends Activity {
         );
     }
 
+    private class LocalStreamServer {
+        private final RemoteItem item;
+        private final ExecutorService clients = Executors.newFixedThreadPool(2);
+        private final AtomicBoolean running = new AtomicBoolean(false);
+        private ServerSocket serverSocket;
+        private Thread acceptThread;
+
+        LocalStreamServer(RemoteItem item) {
+            this.item = item;
+        }
+
+        void start() throws Exception {
+            serverSocket = new ServerSocket();
+            serverSocket.setReuseAddress(true);
+            serverSocket.bind(new InetSocketAddress(InetAddress.getByName("127.0.0.1"), 0));
+            running.set(true);
+            acceptThread = new Thread(() -> {
+                while (running.get()) {
+                    try {
+                        Socket socket = serverSocket.accept();
+                        clients.execute(() -> handleClient(socket));
+                    } catch (Exception e) {
+                        if (running.get()) {
+                            // VideoView retries the URL when a transient request fails.
+                        }
+                    }
+                }
+            }, "nas-stream-accept");
+            acceptThread.start();
+        }
+
+        String getUrl() {
+            return "http://127.0.0.1:" + serverSocket.getLocalPort() + "/media";
+        }
+
+        void stop() {
+            running.set(false);
+            if (serverSocket != null) {
+                try {
+                    serverSocket.close();
+                } catch (Exception ignored) {
+                    // Closing wakes the accept loop.
+                }
+            }
+            clients.shutdownNow();
+            if (acceptThread != null) {
+                acceptThread.interrupt();
+            }
+        }
+
+        private void handleClient(Socket socket) {
+            try (Socket client = socket) {
+                client.setSoTimeout(15_000);
+                BufferedReader reader = new BufferedReader(new InputStreamReader(
+                        client.getInputStream(),
+                        StandardCharsets.ISO_8859_1
+                ));
+                String requestLine = reader.readLine();
+                if (requestLine == null) {
+                    return;
+                }
+                boolean headOnly = requestLine.startsWith("HEAD ");
+                String range = null;
+                String line;
+                while ((line = reader.readLine()) != null && !line.isEmpty()) {
+                    int separator = line.indexOf(':');
+                    if (separator > 0 && "range".equalsIgnoreCase(line.substring(0, separator).trim())) {
+                        range = line.substring(separator + 1).trim();
+                    }
+                }
+                final String requestedRange = range;
+                withShare(item.share, share -> {
+                    streamResponse(
+                            share,
+                            item.path,
+                            mimeType(item.name),
+                            requestedRange,
+                            headOnly,
+                            client.getOutputStream()
+                    );
+                    return null;
+                });
+            } catch (Exception ignored) {
+                // VideoView can abandon a range request when the user seeks again.
+            }
+        }
+
+        private void streamResponse(
+                DiskShare share,
+                String path,
+                String mime,
+                String range,
+                boolean headOnly,
+                OutputStream output
+        ) throws Exception {
+            long total = share.getFileInformation(path)
+                    .getStandardInformation()
+                    .getEndOfFile();
+            long start = 0;
+            long end = Math.max(0, total - 1);
+            boolean partial = range != null && range.startsWith("bytes=");
+            if (partial) {
+                String value = range.substring(6);
+                String[] parts = value.split("-", 2);
+                if (!parts[0].isEmpty()) {
+                    start = Math.max(0, Long.parseLong(parts[0]));
+                }
+                if (parts.length > 1 && !parts[1].isEmpty()) {
+                    end = Math.min(end, Long.parseLong(parts[1]));
+                }
+            }
+            if (start >= total || end < start) {
+                output.write(("HTTP/1.1 416 Range Not Satisfiable\r\n"
+                        + "Content-Range: bytes */" + total + "\r\n"
+                        + "Connection: close\r\n\r\n").getBytes(StandardCharsets.ISO_8859_1));
+                return;
+            }
+
+            long length = end - start + 1;
+            StringBuilder headers = new StringBuilder();
+            headers.append(partial ? "HTTP/1.1 206 Partial Content\r\n" : "HTTP/1.1 200 OK\r\n");
+            headers.append("Accept-Ranges: bytes\r\n");
+            headers.append("Content-Type: ").append(mime).append("\r\n");
+            headers.append("Content-Length: ").append(length).append("\r\n");
+            if (partial) {
+                headers.append("Content-Range: bytes ").append(start).append("-").append(end)
+                        .append("/").append(total).append("\r\n");
+            }
+            headers.append("Connection: close\r\n\r\n");
+            output.write(headers.toString().getBytes(StandardCharsets.ISO_8859_1));
+            if (headOnly) {
+                return;
+            }
+
+            try (File file = openReadFile(share, path)) {
+                byte[] buffer = new byte[STREAM_BUFFER_SIZE];
+                long offset = start;
+                long remaining = length;
+                while (running.get() && remaining > 0) {
+                    int requested = (int) Math.min(buffer.length, remaining);
+                    int read = file.read(buffer, offset, 0, requested);
+                    if (read <= 0) {
+                        break;
+                    }
+                    output.write(buffer, 0, read);
+                    offset += read;
+                    remaining -= read;
+                }
+                output.flush();
+            }
+        }
+    }
+
+    private static String mimeType(String name) {
+        String lower = lower(name);
+        if (lower.endsWith(".mp4") || lower.endsWith(".m4v")) return "video/mp4";
+        if (lower.endsWith(".mkv")) return "video/x-matroska";
+        if (lower.endsWith(".webm")) return "video/webm";
+        if (lower.endsWith(".3gp")) return "video/3gpp";
+        if (lower.endsWith(".avi")) return "video/x-msvideo";
+        if (lower.endsWith(".mp3")) return "audio/mpeg";
+        if (lower.endsWith(".m4a")) return "audio/mp4";
+        if (lower.endsWith(".aac")) return "audio/aac";
+        if (lower.endsWith(".wav")) return "audio/wav";
+        if (lower.endsWith(".flac")) return "audio/flac";
+        if (lower.endsWith(".ogg")) return "audio/ogg";
+        return "application/octet-stream";
+    }
+
     private ArrayList<String> listShareNames() throws Exception {
-        if (config == null || config.host.isEmpty()) {
+        return listShareNames(config);
+    }
+
+    private ArrayList<String> listShareNames(NasConfig targetConfig) throws Exception {
+        if (targetConfig == null || targetConfig.host.isEmpty()) {
             throw new IllegalStateException("\u30db\u30b9\u30c8\u540d\u307e\u305f\u306fIP\u3092\u5165\u529b\u3057\u3066\u304f\u3060\u3055\u3044\u3002");
         }
 
@@ -1556,12 +2401,12 @@ public class MainActivity extends Activity {
         CIFSContext base = new BaseContext(new PropertyConfiguration(properties));
         NtlmPasswordAuthenticator auth = new NtlmPasswordAuthenticator(
                 null,
-                config.user,
-                config.password
+                targetConfig.user,
+                targetConfig.password
         );
         CIFSContext context = base.withCredentials(auth);
         ArrayList<String> names = new ArrayList<>();
-        try (SmbFile root = new SmbFile("smb://" + config.host + "/", context)) {
+        try (SmbFile root = new SmbFile("smb://" + targetConfig.host + "/", context)) {
             for (SmbFile file : root.listFiles()) {
                 String name = file.getName();
                 if (!name.endsWith("/")) {
@@ -1581,18 +2426,7 @@ public class MainActivity extends Activity {
         if (config == null || config.host.isEmpty() || shareName == null || shareName.isEmpty()) {
             throw new IllegalStateException("\u30db\u30b9\u30c8\u540d\u307e\u305f\u306fIP\u3092\u5165\u529b\u3057\u3066\u304f\u3060\u3055\u3044\u3002");
         }
-        try (SMBClient client = new SMBClient();
-             Connection connection = client.connect(config.host)) {
-            AuthenticationContext auth = new AuthenticationContext(
-                    config.user,
-                    config.password.toCharArray(),
-                    null
-            );
-            Session session = connection.authenticate(auth);
-            try (DiskShare share = (DiskShare) session.connectShare(shareName)) {
-                return action.run(share);
-            }
-        }
+        return smbSessionPool.withShare(config, shareName, action);
     }
 
     private LinearLayout baseRoot() {
@@ -1750,6 +2584,18 @@ public class MainActivity extends Activity {
         }
     }
 
+    private static void copy(
+            InputStream input,
+            OutputStream output,
+            ThumbnailLoad thumbnailLoad
+    ) throws Exception {
+        byte[] buffer = new byte[64 * 1024];
+        int read;
+        while (!thumbnailLoad.isCancelled() && (read = input.read(buffer)) != -1) {
+            output.write(buffer, 0, read);
+        }
+    }
+
     private static String normalizePath(String value) {
         String path = value.trim().replace('\\', '/');
         while (path.startsWith("/")) {
@@ -1806,16 +2652,169 @@ public class MainActivity extends Activity {
         return name.toLowerCase(Locale.ROOT);
     }
 
-    private static String safeCacheName(String name) {
-        return name.replaceAll("[^a-zA-Z0-9._-]", "_");
-    }
-
     private int dp(int value) {
         return (int) (value * getResources().getDisplayMetrics().density + 0.5f);
     }
 
     private interface ShareAction<T> {
         T run(DiskShare share) throws Exception;
+    }
+
+    private static class SmbSessionPool {
+        private SMBClient client;
+        private Connection connection;
+        private Session session;
+        private String identity = "";
+
+        <T> T withShare(NasConfig config, String shareName, ShareAction<T> action) throws Exception {
+            DiskShare share;
+            try {
+                share = (DiskShare) getSession(config).connectShare(shareName);
+            } catch (Exception connectionFailure) {
+                reset();
+                share = (DiskShare) getSession(config).connectShare(shareName);
+            }
+            try (DiskShare activeShare = share) {
+                return action.run(activeShare);
+            }
+        }
+
+        private synchronized Session getSession(NasConfig config) throws Exception {
+            String requestedIdentity = config.host + "\u0000" + config.user + "\u0000" + config.password;
+            if (session != null && requestedIdentity.equals(identity)) {
+                return session;
+            }
+            reset();
+            client = new SMBClient();
+            connection = client.connect(config.host);
+            AuthenticationContext auth = new AuthenticationContext(
+                    config.user,
+                    config.password.toCharArray(),
+                    null
+            );
+            session = connection.authenticate(auth);
+            identity = requestedIdentity;
+            return session;
+        }
+
+        synchronized void reset() {
+            if (connection != null) {
+                try {
+                    connection.close();
+                } catch (Exception ignored) {
+                    // Reconnect on the next operation.
+                }
+            }
+            if (client != null) {
+                try {
+                    client.close();
+                } catch (Exception ignored) {
+                    // Reconnect on the next operation.
+                }
+            }
+            session = null;
+            connection = null;
+            client = null;
+            identity = "";
+        }
+
+        void close() {
+            reset();
+        }
+    }
+
+    private static class DirectoryLoad {
+        private final AtomicBoolean cancelled = new AtomicBoolean(false);
+        private final AtomicReference<Connection> connection = new AtomicReference<>();
+        volatile Future<?> future;
+
+        boolean isCancelled() {
+            return cancelled.get();
+        }
+
+        void attachConnection(Connection value) throws Exception {
+            connection.set(value);
+            if (cancelled.get()) {
+                closeConnection();
+                throw new InterruptedException("Directory loading was cancelled.");
+            }
+        }
+
+        void detachConnection(Connection value) {
+            connection.compareAndSet(value, null);
+        }
+
+        void cancel() {
+            cancelled.set(true);
+            closeConnection();
+            Future<?> activeFuture = future;
+            if (activeFuture != null) {
+                activeFuture.cancel(true);
+            }
+        }
+
+        void closeConnection() {
+            Connection activeConnection = connection.getAndSet(null);
+            if (activeConnection != null) {
+                try {
+                    activeConnection.close();
+                } catch (Exception ignored) {
+                    // Closing the SMB connection is best-effort during cancellation.
+                }
+            }
+        }
+    }
+
+    private static class ThumbnailLoad {
+        private final AtomicBoolean cancelled = new AtomicBoolean(false);
+        private final AtomicReference<Connection> connection = new AtomicReference<>();
+        volatile Future<?> future;
+
+        boolean isCancelled() {
+            return cancelled.get();
+        }
+
+        void attachConnection(Connection value) throws Exception {
+            connection.set(value);
+            if (cancelled.get()) {
+                closeConnection();
+                throw new InterruptedException("Thumbnail loading was cancelled.");
+            }
+        }
+
+        void detachConnection(Connection value) {
+            connection.compareAndSet(value, null);
+        }
+
+        void cancel() {
+            cancelled.set(true);
+            closeConnection();
+            Future<?> activeFuture = future;
+            if (activeFuture != null) {
+                activeFuture.cancel(true);
+            }
+        }
+
+        void closeConnection() {
+            Connection activeConnection = connection.getAndSet(null);
+            if (activeConnection != null) {
+                try {
+                    activeConnection.close();
+                } catch (Exception ignored) {
+                    // Closing the SMB connection is best-effort during cancellation.
+                }
+            }
+        }
+    }
+
+    private static class DirectoryCacheEntry {
+        final long savedAt;
+        final List<RemoteItem> items;
+
+        DirectoryCacheEntry(long savedAt, List<RemoteItem> items) {
+            this.savedAt = savedAt;
+            this.items = items;
+        }
     }
 
     private static class NasConfig {
